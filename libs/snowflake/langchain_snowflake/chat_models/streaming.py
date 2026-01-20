@@ -96,12 +96,20 @@ class SnowflakeStreaming:
 
         This eliminates code duplication by using the sync implementation
         with asyncio.to_thread() for non-blocking execution.
+
+        IMPORTANT: Always yields at least one chunk to avoid "No generations found in stream"
+        error when used with astream_events.
         """
         # Determine streaming method based on tool requirements
+        has_yielded = False
+        logger.info(f"_astream called with {len(messages)} messages")
         try:
-            if self._should_use_rest_api():
+            should_use_rest = self._should_use_rest_api()
+            logger.info(f"_should_use_rest_api returned: {should_use_rest}")
+            if should_use_rest:
                 # Use native async REST API streaming with aiohttp
                 async for chunk in self._astream_via_rest_api(messages, run_manager, **kwargs):
+                    has_yielded = True
                     yield chunk
             else:
                 # For SQL-based streaming, we currently delegate to sync method since
@@ -111,6 +119,7 @@ class SnowflakeStreaming:
 
                 chunks = await asyncio.to_thread(sync_stream)
                 for chunk in chunks:
+                    has_yielded = True
                     yield chunk
 
         except Exception as e:
@@ -124,7 +133,18 @@ class SnowflakeStreaming:
             # Convert ChatResult to streaming chunk format
             error_content = error_result.generations[0].message.content
             error_chunk = ChatGenerationChunk(message=AIMessageChunk(content=error_content))
+            has_yielded = True
             yield error_chunk
+
+        # CRITICAL FIX: Always yield at least one chunk to avoid "No generations found in stream"
+        # This is required for compatibility with LangChain's astream_events
+        if not has_yielded:
+            # Yield an empty chunk with minimal content
+            empty_chunk = ChatGenerationChunk(
+                message=AIMessageChunk(content=""),
+                generation_info={"fallback": True}
+            )
+            yield empty_chunk
 
     def _stream_via_rest_api(
         self,
@@ -225,32 +245,83 @@ class SnowflakeStreaming:
             )
 
             # Use centralized async streaming
+            logger.info("Starting async streaming from Cortex Complete REST API")
+            chunk_count = 0
             async for chunk_json in RestApiClient.make_async_streaming_request(
                 request_config, "async streaming Cortex Complete"
             ):
+                chunk_count += 1
+                logger.info(f"Received chunk #{chunk_count}: {repr(chunk_json)[:200]}")
                 if chunk_json:
                     # Parse JSON chunk and extract content
                     try:
                         import json
+                        from langchain_core.messages.tool import tool_call_chunk
 
                         chunk_data = json.loads(chunk_json)
+                        logger.info(f"Parsed chunk data: {chunk_data}")
                         # Extract content from Cortex Complete format
+                        # The format is: {"choices": [{"delta": {"text": "...", "type": "text"|"tool_use"}}]}
                         if isinstance(chunk_data, dict):
-                            chunk_content = chunk_data.get("content", "")
+                            choices = chunk_data.get("choices", [])
+                            if choices and isinstance(choices, list):
+                                delta = choices[0].get("delta", {})
+                                delta_type = delta.get("type")
+
+                                # Handle text chunks
+                                chunk_content = delta.get("text", "")
+
+                                # Handle tool_use chunks
+                                tool_call_chunks = []
+                                if delta_type == "tool_use":
+                                    tool_call_id = delta.get("tool_use_id", "")
+                                    tool_name = delta.get("name", "")
+                                    tool_input = delta.get("input", "")
+
+                                    if tool_call_id or tool_name or tool_input:
+                                        # Create tool call chunk
+                                        tc_chunk = {
+                                            "index": 0,
+                                        }
+                                        if tool_call_id:
+                                            tc_chunk["id"] = tool_call_id
+                                        if tool_name:
+                                            tc_chunk["name"] = tool_name
+                                        if tool_input:
+                                            tc_chunk["args"] = tool_input
+
+                                        tool_call_chunks = [tc_chunk]
+                                        logger.info(f"Tool call chunk: {tc_chunk}")
+                            else:
+                                # Fallback to top-level content
+                                chunk_content = chunk_data.get("content", "")
+                                tool_call_chunks = []
                         else:
                             chunk_content = str(chunk_data)
-                    except (json.JSONDecodeError, TypeError):
+                            tool_call_chunks = []
+                    except (json.JSONDecodeError, TypeError) as e:
                         # Fallback: treat as plain text
+                        logger.warning(f"JSON decode failed: {e}, treating as plain text")
                         chunk_content = chunk_json
+                        tool_call_chunks = []
 
-                    if chunk_content:
+                    logger.info(f"Chunk content: {repr(chunk_content)}, tool_call_chunks: {len(tool_call_chunks)}")
+                    # Yield chunk if we have either content or tool calls
+                    if chunk_content or tool_call_chunks:
                         chunk = ChatGenerationChunk(
-                            message=AIMessageChunk(content=chunk_content),
+                            message=AIMessageChunk(
+                                content=chunk_content,
+                                tool_call_chunks=tool_call_chunks
+                            ),
                             generation_info={"stream": True},
                         )
-                        if run_manager:
+                        if run_manager and chunk_content:
                             await run_manager.on_llm_new_token(chunk_content)
+                        logger.info(f"Yielding chunk: content_length={len(chunk_content)}, tool_calls={len(tool_call_chunks)}")
                         yield chunk
+                    else:
+                        logger.info("Skipping chunk with no content or tool calls")
+            logger.info(f"Async streaming completed. Total chunks received: {chunk_count}")
 
         except Exception as e:
             # Use centralized error handling
